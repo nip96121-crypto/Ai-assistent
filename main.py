@@ -405,6 +405,30 @@ class TelegramAIUserbot:
             except Exception as e:
                 logger.warning(f"Could not start Render healthcheck server: {e}")
 
+        # Keep-alive background task to prevent Render free tier from idling/sleeping
+        async def keep_alive_pinger():
+            """Ping own public URL every 10 minutes to prevent Render free tier from sleeping."""
+            import aiohttp
+            url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PING_URL")
+            if not url:
+                logger.info("Keep-alive pinger: RENDER_EXTERNAL_URL or PING_URL not configured.")
+                return
+            if not url.startswith("http"):
+                url = f"https://{url}"
+            target_url = f"{url.rstrip('/')}/health"
+            logger.info(f"🚀 Keep-alive pinger activated for: {target_url} (interval: 10m)")
+            await asyncio.sleep(120)
+            while True:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(target_url, timeout=25) as resp:
+                            logger.info(f"⏰ Keep-alive ping sent to {target_url} (HTTP {resp.status})")
+                except Exception as ping_err:
+                    logger.debug(f"Keep-alive ping error: {ping_err}")
+                await asyncio.sleep(600)  # Ping every 10 minutes
+
+        asyncio.create_task(keep_alive_pinger())
+
         await self.client.run_until_disconnected()
 
 
