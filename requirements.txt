@@ -1,0 +1,25 @@
+# Telegram MTProto Client
+telethon>=1.36.0
+
+# AI & LLM
+openai>=1.51.0
+tiktoken>=0.7.0
+
+# Database & Vector Store (RAG)
+supabase>=2.8.0
+postgrest>=0.16.0
+gotrue>=2.8.0
+
+# Media Processing
+opencv-python-headless>=4.10.0.84
+pydub>=0.25.1
+numpy>=1.26.0
+
+# Environment & Settings
+python-dotenv>=1.0.1
+pydantic>=2.9.2
+pydantic-settings>=2.5.2
+
+# Async & Networking Utilities
+aiohttp>=3.10.5
+aiofiles>=24.1.0

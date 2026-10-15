@@ -1,0 +1,15 @@
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Telegram session files
+*.session
+*.session-journal
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+
+# Temporary media
+temp_media/

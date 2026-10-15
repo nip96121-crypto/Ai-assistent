@@ -1,0 +1,39 @@
+# Environment variables & secrets (CRITICAL: Never commit!)
+.env
+.env.*
+!.env.example
+
+# Telegram session files (CRITICAL: Contains your Telegram account access!)
+*.session
+*.session-journal
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Temporary media & downloads
+temp_media/
+*.ogg
+*.oga
+*.mp3
+*.wav
+*.mp4
+*.mkv
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
