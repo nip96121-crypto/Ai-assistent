@@ -15,6 +15,15 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+# Configure logging early so INFO level is respected across all modules
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
+)
+logger = logging.getLogger("Userbot.Main")
+
 from typing import Optional
 
 from openai import AsyncOpenAI
@@ -31,13 +40,6 @@ from media_processor.video_handler import VideoHandler
 from utils.filters import FilterManager
 from utils.telegram_helpers import TelegramChatAction, safe_send_message
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger("Userbot.Main")
 
 
 class TelegramAIUserbot:
@@ -54,11 +56,13 @@ class TelegramAIUserbot:
             sys.exit(1)
 
         # Initialize MTProto Telethon client (supports StringSession for cloud/Render or file session)
-        if config.telegram_string_session:
+        session_str = config.telegram_string_session
+        print(f"📡 SESSION CONFIG: TELEGRAM_STRING_SESSION present={bool(session_str)}, length={len(session_str)}")
+        if session_str:
             logger.info("Using TELEGRAM_STRING_SESSION for authentication.")
-            session_target = StringSession(config.telegram_string_session)
+            session_target = StringSession(session_str)
         else:
-            logger.info(f"Using local file session: {config.telegram_session_name}")
+            logger.warning(f"No TELEGRAM_STRING_SESSION found! Using local file session: {config.telegram_session_name}")
             session_target = config.telegram_session_name
 
         self.client = TelegramClient(
@@ -294,7 +298,15 @@ class TelegramAIUserbot:
 
         # Connect and authenticate
         await self.client.connect()
-        if not await self.client.is_user_authorized():
+        is_auth = await self.client.is_user_authorized()
+        print(f"📡 AUTH STATUS: is_user_authorized = {is_auth}")
+        if not is_auth:
+            from telethon import functions
+            try:
+                await self.client(functions.updates.GetStateRequest())
+            except Exception as auth_err:
+                print(f"📡 AUTH ERROR: {type(auth_err).__name__}: {auth_err}")
+
             if not sys.stdin or not sys.stdin.isatty():
                 logger.critical(
                     "❌ Telegram akkaunt avtorizatsiyadan o'tmagan!\n"
