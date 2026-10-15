@@ -86,7 +86,11 @@ class AppConfig:
         default_factory=lambda: os.getenv("TELEGRAM_PHONE_NUMBER", "").strip()
     )
     telegram_string_session: str = field(
-        default_factory=lambda: os.getenv("TELEGRAM_STRING_SESSION", "").strip()
+        default_factory=lambda: os.getenv("TELEGRAM_STRING_SESSION", "")
+        .strip()
+        .strip('"')
+        .strip("'")
+        .strip()
     )
 
     # --------------------------------------------------------------------------

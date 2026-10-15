@@ -54,11 +54,13 @@ class TelegramAIUserbot:
             sys.exit(1)
 
         # Initialize MTProto Telethon client (supports StringSession for cloud/Render or file session)
-        session_target = (
-            StringSession(config.telegram_string_session)
-            if config.telegram_string_session
-            else config.telegram_session_name
-        )
+        if config.telegram_string_session:
+            logger.info("Using TELEGRAM_STRING_SESSION for authentication.")
+            session_target = StringSession(config.telegram_string_session)
+        else:
+            logger.info(f"Using local file session: {config.telegram_session_name}")
+            session_target = config.telegram_session_name
+
         self.client = TelegramClient(
             session=session_target,
             api_id=config.telegram_api_id,
@@ -293,6 +295,14 @@ class TelegramAIUserbot:
         # Connect and authenticate
         await self.client.connect()
         if not await self.client.is_user_authorized():
+            if not sys.stdin or not sys.stdin.isatty():
+                logger.critical(
+                    "❌ Telegram akkaunt avtorizatsiyadan o'tmagan!\n"
+                    "Render serverida TELEGRAM_STRING_SESSION topilmadi yoki noto'g'ri kiritilgan.\n"
+                    "Iltimos, Render boshqaruv panelidagi 'Environment' bo'limiga TELEGRAM_STRING_SESSION kalitini to'g'ri qo'shing."
+                )
+                sys.exit(1)
+
             phone = config.telegram_phone_number or input("Telefon raqamingizni kiriting (+998...): ").strip()
             print(f"\n📡 Telegram'dan login kodi so'ralmoqda ({phone})...")
             sent_code = await self.client.send_code_request(phone)
