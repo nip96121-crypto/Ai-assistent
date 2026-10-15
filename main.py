@@ -29,7 +29,38 @@ from typing import Optional
 from openai import AsyncOpenAI
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
-from telethon.sessions import StringSession
+import base64
+import ipaddress
+import re
+import struct
+from telethon.crypto import AuthKey
+from telethon.sessions.string import StringSession, _STRUCT_PREFORMAT, CURRENT_VERSION
+
+
+class SafeStringSession(StringSession):
+    """Robust StringSession parser that handles trailing spaces, quotes, and prevents struct unpack errors."""
+
+    def __init__(self, string: str = None):
+        super(StringSession, self).__init__()
+        if string:
+            cleaned = str(string).strip().strip('"').strip("'").strip()
+            m = re.search(r"1[A-Za-z0-9_\-]{351}=", cleaned)
+            if m:
+                cleaned = m.group(0)
+
+            if not cleaned or cleaned[0] != CURRENT_VERSION:
+                raise ValueError("Not a valid string")
+
+            payload = cleaned[1:]
+            decoded = StringSession.decode(payload)
+            ip_len = 4 if len(decoded) == 263 else 16
+            self._dc_id, ip, self._port, key = struct.unpack(
+                _STRUCT_PREFORMAT.format(ip_len), decoded
+            )
+            self._server_address = ipaddress.ip_address(ip).compressed
+            if any(key):
+                self._auth_key = AuthKey(key)
+
 from telethon.tl.custom import Message
 
 from config import config
@@ -39,7 +70,6 @@ from media_processor.audio_handler import AudioHandler
 from media_processor.video_handler import VideoHandler
 from utils.filters import FilterManager
 from utils.telegram_helpers import TelegramChatAction, safe_send_message
-
 
 
 class TelegramAIUserbot:
@@ -59,8 +89,8 @@ class TelegramAIUserbot:
         session_str = config.telegram_string_session
         print(f"📡 SESSION CONFIG: TELEGRAM_STRING_SESSION present={bool(session_str)}, length={len(session_str)}")
         if session_str:
-            logger.info("Using TELEGRAM_STRING_SESSION for authentication.")
-            session_target = StringSession(session_str)
+            logger.info("Using TELEGRAM_STRING_SESSION (SafeStringSession) for authentication.")
+            session_target = SafeStringSession(session_str)
         else:
             logger.warning(f"No TELEGRAM_STRING_SESSION found! Using local file session: {config.telegram_session_name}")
             session_target = config.telegram_session_name
