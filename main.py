@@ -407,25 +407,44 @@ class TelegramAIUserbot:
 
         # Keep-alive background task to prevent Render free tier from idling/sleeping
         async def keep_alive_pinger():
-            """Ping own public URL every 10 minutes to prevent Render free tier from sleeping."""
+            """Keep bot alive: sends HTTP ping to Render and sends heartbeat message to Telegram Saved Messages."""
             import aiohttp
+            import datetime
+
             url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PING_URL")
-            if not url:
-                logger.info("Keep-alive pinger: RENDER_EXTERNAL_URL or PING_URL not configured.")
-                return
-            if not url.startswith("http"):
-                url = f"https://{url}"
-            target_url = f"{url.rstrip('/')}/health"
-            logger.info(f"🚀 Keep-alive pinger activated for: {target_url} (interval: 10m)")
-            await asyncio.sleep(120)
+            target_url = None
+            if url:
+                if not url.startswith("http"):
+                    url = f"https://{url}"
+                target_url = f"{url.rstrip('/')}/health"
+                logger.info(f"🚀 Render Keep-alive HTTP pinger active for: {target_url}")
+
+            # Heartbeat to Telegram Saved Messages ("me") every 14 minutes
+            send_tg_msg = os.getenv("SEND_TELEGRAM_HEARTBEAT", "True").lower() in ("true", "1", "yes")
+
+            # Initial wait before starting pinger loop
+            await asyncio.sleep(60)
             while True:
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(target_url, timeout=25) as resp:
-                            logger.info(f"⏰ Keep-alive ping sent to {target_url} (HTTP {resp.status})")
-                except Exception as ping_err:
-                    logger.debug(f"Keep-alive ping error: {ping_err}")
-                await asyncio.sleep(600)  # Ping every 10 minutes
+                # 1. HTTP ping to Render web service (resets Render 15-minute inactivity timer)
+                if target_url:
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(target_url, timeout=25) as resp:
+                                logger.info(f"⏰ Keep-alive HTTP ping sent to {target_url} (HTTP {resp.status})")
+                    except Exception as ping_err:
+                        logger.debug(f"Keep-alive HTTP ping error: {ping_err}")
+
+                # 2. Telegram message to Saved Messages ("me") so user sees bot is alive 24/7
+                if send_tg_msg:
+                    try:
+                        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        await self.client.send_message("me", f"💓 **Bot faol (24/7):** Server ishlab turibdi.\nVaqt: `{now_str}`")
+                        logger.info("📩 Heartbeat message sent to Saved Messages.")
+                    except Exception as tg_err:
+                        logger.debug(f"Telegram heartbeat send error: {tg_err}")
+
+                # Sleep 14 minutes (840 seconds)
+                await asyncio.sleep(14 * 60)
 
         asyncio.create_task(keep_alive_pinger())
 
