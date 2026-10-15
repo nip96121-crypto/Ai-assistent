@@ -20,6 +20,7 @@ from typing import Optional
 from openai import AsyncOpenAI
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
+from telethon.sessions import StringSession
 from telethon.tl.custom import Message
 
 from config import config
@@ -52,9 +53,14 @@ class TelegramAIUserbot:
             logger.error("Please configure the missing keys in .env and restart.")
             sys.exit(1)
 
-        # Initialize MTProto Telethon client
+        # Initialize MTProto Telethon client (supports StringSession for cloud/Render or file session)
+        session_target = (
+            StringSession(config.telegram_string_session)
+            if config.telegram_string_session
+            else config.telegram_session_name
+        )
         self.client = TelegramClient(
-            session=config.telegram_session_name,
+            session=session_target,
             api_id=config.telegram_api_id,
             api_hash=config.telegram_api_hash,
         )
@@ -329,7 +335,23 @@ class TelegramAIUserbot:
             f"{'Supabase pgvector (RAG)' if config.is_supabase_configured() else 'In-Memory Cache'}"
         )
         print("=" * 70)
-        print("\nListening for incoming messages... Press Ctrl+C to terminate.")
+        # If running on Render Web Service, start lightweight HTTP healthcheck server
+        import os
+        port_str = os.getenv("PORT")
+        if port_str:
+            try:
+                from aiohttp import web
+                port = int(port_str)
+                app = web.Application()
+                app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
+                app.router.add_get("/health", lambda r: web.Response(text="OK"))
+                runner = web.AppRunner(app)
+                await runner.setup()
+                site = web.TCPSite(runner, "0.0.0.0", port)
+                await site.start()
+                logger.info(f"Render healthcheck HTTP server running on port {port}")
+            except Exception as e:
+                logger.warning(f"Could not start Render healthcheck server: {e}")
 
         await self.client.run_until_disconnected()
 
