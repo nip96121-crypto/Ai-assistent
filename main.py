@@ -182,6 +182,41 @@ class TelegramAIUserbot:
                         batch.task.cancel()
                     logger.info(f"Owner personally replied in chat {event.chat_id}. Cancelled pending AI batch.")
 
+            # Record owner's manual message into persistent memory so AI remembers what the owner said!
+            try:
+                out_content = event.message.text or ""
+                out_type = "text"
+                if not out_content:
+                    if event.message.voice:
+                        out_content = "[Ovozli xabar]"
+                        out_type = "voice"
+                    elif event.message.video or event.message.video_note:
+                        out_content = "[Video xabar]"
+                        out_type = "video"
+                    elif event.message.photo:
+                        out_content = "[Rasm]"
+                        out_type = "photo"
+
+                if out_content:
+                    created_str = (
+                        event.message.date.strftime("%Y-%m-%d %H:%M:%S")
+                        if event.message.date
+                        else None
+                    )
+                    await self.memory_manager.store_message(
+                        chat_id=event.chat_id,
+                        sender_id=getattr(self.me, "id", 0) if hasattr(self, "me") and self.me else 0,
+                        sender_name=config.owner_name,
+                        role="assistant",
+                        content=out_content,
+                        message_type=out_type,
+                        is_owner=True,
+                        telegram_message_id=event.message.id,
+                        created_at=created_str,
+                    )
+            except Exception as store_err:
+                logger.debug(f"Could not store manual outgoing message: {store_err}")
+
     async def is_owner_online(self) -> bool:
         """Check whether the owner (Ayubxon) is currently active/online on Telegram."""
         import time
@@ -266,17 +301,54 @@ class TelegramAIUserbot:
             sender = await message.get_sender()
             sender_name = (
                 getattr(sender, "first_name", "") or getattr(sender, "title", "User")
-            ).strip()
+            ).strip() or "User"
             logger.info(
                 f"👤 Egasi ({config.owner_name}) hozir Telegramda ONLAYN! "
                 f"AI {sender_name} ga javob bermaydi (egasi o'zi yozishi mumkin)."
             )
+            # Yozishmalar tarixi to'liq saqlanib borishi uchun xabarni xotiraga yozib qo'yamiz
+            try:
+                inc_text = message.text or ("[Ovozli xabar]" if message.voice else "[Media]")
+                created_str = message.date.strftime("%Y-%m-%d %H:%M:%S") if message.date else None
+                await self.memory_manager.store_message(
+                    chat_id=chat_id,
+                    sender_id=message.sender_id or 0,
+                    sender_name=sender_name,
+                    role="user",
+                    content=inc_text,
+                    message_type="text",
+                    is_owner=False,
+                    telegram_message_id=message.id,
+                    created_at=created_str,
+                )
+            except Exception as e:
+                logger.debug(f"Could not record online incoming message: {e}")
             return
 
         # Agar bu chatda egasining o'zi oxirgi 60 soniya ichida yozgan bo'lsa - AI aralashmaydi
         import time
         if time.time() - self.last_manual_outgoing_time.get(chat_id, 0.0) < 60:
             logger.info(f"Egasi bu chatda ({chat_id}) yaqinda o'zi yozgan. AI aralashmaydi.")
+            try:
+                sender = await message.get_sender()
+                sender_name = (
+                    getattr(sender, "first_name", "") or getattr(sender, "title", "User")
+                ).strip() or "User"
+                inc_text = message.text or ("[Ovozli xabar]" if message.voice else "[Media]")
+                created_str = message.date.strftime("%Y-%m-%d %H:%M:%S") if message.date else None
+                await self.memory_manager.store_message(
+                    chat_id=chat_id,
+                    sender_id=message.sender_id or 0,
+                    sender_name=sender_name,
+                    role="user",
+                    content=inc_text,
+                    message_type="text",
+                    is_owner=False,
+                    telegram_message_id=message.id,
+                    created_at=created_str,
+                )
+            except Exception as e:
+                logger.debug(f"Could not record recent manual outgoing incoming message: {e}")
             return
 
         # 6. Agar egasi oflayn bo'lsa (telegramdan chiqqan):
@@ -353,6 +425,80 @@ class TelegramAIUserbot:
             logger.error(f"Error in _wait_and_dispatch_batch for chat {chat_id}: {e}", exc_info=True)
             self.pending_batches.pop(chat_id, None)
 
+    async def sync_telegram_chat_history(
+        self, chat_id: int, limit: int = 15, max_id: Optional[int] = None
+    ) -> None:
+        """
+        Synchronizes past chat history from Telegram servers into local persistent SQLite database.
+        Ensures AI has full awareness of previous conversations, even if they took place
+        while the bot was offline or directly from the owner's Telegram mobile app.
+        """
+        try:
+            kwargs: dict[str, Any] = {"limit": limit}
+            if max_id:
+                kwargs["max_id"] = max_id
+
+            tg_messages = await self.client.get_messages(chat_id, **kwargs)
+            if not tg_messages:
+                return
+
+            for msg in reversed(tg_messages):
+                if not msg:
+                    continue
+
+                content = msg.text or ""
+                msg_type = "text"
+                if not content:
+                    if msg.voice or (msg.audio and getattr(msg.audio, "voice", False)):
+                        content = "[Ovozli xabar]"
+                        msg_type = "voice"
+                    elif msg.video_note or msg.video:
+                        content = "[Video xabar]"
+                        msg_type = "video"
+                    elif msg.photo:
+                        content = "[Rasm yuborildi]"
+                        msg_type = "photo"
+                    elif msg.document:
+                        content = "[Fayl / Hujjat]"
+                        msg_type = "document"
+
+                if not content.strip():
+                    continue
+
+                is_owner = bool(msg.out)
+                role = "assistant" if is_owner else "user"
+
+                sender_id = msg.sender_id or 0
+                if is_owner:
+                    sender_name = config.owner_name
+                else:
+                    try:
+                        sender = await msg.get_sender()
+                        sender_name = (
+                            getattr(sender, "first_name", "")
+                            or getattr(sender, "title", "User")
+                        ).strip() or "User"
+                    except Exception:
+                        sender_name = "User"
+
+                created_at_str = (
+                    msg.date.strftime("%Y-%m-%d %H:%M:%S") if msg.date else None
+                )
+
+                await self.memory_manager.store_message(
+                    chat_id=chat_id,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    role=role,
+                    content=content,
+                    message_type=msg_type,
+                    is_owner=is_owner,
+                    telegram_message_id=msg.id,
+                    created_at=created_at_str,
+                )
+        except Exception as e:
+            logger.debug(f"History sync note for chat {chat_id}: {e}")
+
     async def _process_messages_and_reply(
         self,
         chat_id: int,
@@ -369,6 +515,17 @@ class TelegramAIUserbot:
         sender_name = (
             getattr(sender, "first_name", "") or getattr(sender, "title", "User")
         ).strip()
+
+        # Synchronize earlier conversation history from Telegram before processing
+        try:
+            earliest_id = min((m.id for m in messages), default=None)
+            await self.sync_telegram_chat_history(
+                chat_id=chat_id,
+                limit=config.max_recent_messages,
+                max_id=earliest_id,
+            )
+        except Exception as sync_err:
+            logger.debug(f"History sync note for chat {chat_id}: {sync_err}")
 
         # Extract contents across messages
         text_parts: list[str] = []
@@ -436,6 +593,12 @@ class TelegramAIUserbot:
             )
             if sent_msg:
                 self.bot_sent_msg_ids.add(sent_msg.id)
+                try:
+                    await self.memory_manager.update_last_assistant_telegram_id(
+                        chat_id=chat_id, telegram_message_id=sent_msg.id
+                    )
+                except Exception:
+                    pass
 
             # Mark message as read AFTER the AI userbot has replied
             if config.auto_read_messages and not latest_message.out:
@@ -448,7 +611,7 @@ class TelegramAIUserbot:
             if not is_owner and latest_message.is_private:
                 try:
                     summary_text = (
-                        f"📩 **Siz band bo'lganingizda sizning nomingizdan javob berildi:**\n\n"
+                        f"📩 **Sizning nomingizdan javob berildi:**\n\n"
                         f"👤 **Kimdan:** {sender_name} (ID: `{sender_id}`)\n"
                         f"💬 **Kelgan xabar(lar):**\n{combined_text}\n\n"
                         f"💬 **Sizdek berilgan javob:**\n{reply_text}"
@@ -510,6 +673,7 @@ class TelegramAIUserbot:
         await self.filter_manager.initialize()
 
         me = await self.client.get_me()
+        self.me = me
         print("\n" + "=" * 70)
         print(f"✅ Logged in successfully as: {me.first_name} (@{me.username}) [ID: {me.id}]")
         engine_name = (
@@ -521,7 +685,7 @@ class TelegramAIUserbot:
         print(f"🧠 AI Engine: {engine_name}")
         print(
             f"🗄️ Database Memory: "
-            f"{'Supabase pgvector (RAG)' if config.is_supabase_configured() else 'In-Memory Cache'}"
+            f"{'Supabase pgvector (RAG) + SQLite' if config.is_supabase_configured() else 'Persistent SQLite (data/chat_history.db)'}"
         )
         print("=" * 70)
         # ----------------------------------------------------------------------

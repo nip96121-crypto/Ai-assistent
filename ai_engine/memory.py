@@ -1,25 +1,30 @@
 """
-Supabase PostgreSQL + pgvector integration for long-term memory and RAG.
-Stores chat history with vector embeddings and retrieves semantic context.
+Persistent memory manager for Sunnatbek's Multimodal Telegram AI Executive Assistant.
+Combines local SQLite persistent storage (works 100% offline and across restarts)
+with optional Supabase PostgreSQL + pgvector RAG semantic search.
 """
 
 from __future__ import annotations
 
 import asyncio
+import datetime
+import json
 import logging
+import sqlite3
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from openai import AsyncOpenAI
 from supabase import Client, create_client
 
-from config import config
+from config import BASE_DIR, config
 
 logger = logging.getLogger("Userbot.Memory")
 
 
 class MemoryManager:
-    """Manages long-term vector memory (Supabase + pgvector) with in-memory fallback."""
+    """Manages persistent SQLite memory with optional Supabase pgvector RAG."""
 
     def __init__(self, openai_client: Optional[AsyncOpenAI] = None):
         self.openai_client = None
@@ -29,14 +34,55 @@ class MemoryManager:
             )
         self.supabase: Optional[Client] = None
         self._in_memory_fallback: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+
+        # Initialize persistent SQLite storage
+        self.db_dir = BASE_DIR / "data"
+        self.db_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path = self.db_dir / "chat_history.db"
+        self._init_sqlite()
+
+        # Initialize Supabase if configured
         self._init_supabase()
+
+    def _init_sqlite(self) -> None:
+        """Initialize local persistent SQLite database for conversation history."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS chat_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_id INTEGER NOT NULL,
+                        telegram_message_id INTEGER,
+                        sender_id INTEGER NOT NULL,
+                        sender_name TEXT,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        message_type TEXT DEFAULT 'text',
+                        is_owner INTEGER DEFAULT 0,
+                        created_at TEXT,
+                        metadata TEXT
+                    )
+                """)
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_msg_unique
+                    ON chat_messages(chat_id, telegram_message_id)
+                    WHERE telegram_message_id IS NOT NULL
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_chat_id_order
+                    ON chat_messages(chat_id, id DESC)
+                """)
+                conn.commit()
+            logger.info(f"SQLite persistent chat history database ready at: {self.db_path}")
+        except Exception as e:
+            logger.error(f"Failed to initialize SQLite database: {e}", exc_info=True)
 
     def _init_supabase(self) -> None:
         """Initialize the Supabase client if credentials are configured."""
         if not config.is_supabase_configured():
-            logger.warning(
-                "Supabase URL or Key not set or using placeholders. "
-                "Running in fallback in-memory mode. Set SUPABASE_URL and SUPABASE_KEY in .env for persistent RAG."
+            logger.info(
+                "Supabase not configured. Using local SQLite persistent database for all chat history."
             )
             return
 
@@ -44,7 +90,7 @@ class MemoryManager:
             self.supabase = create_client(config.supabase_url, config.supabase_key)
             logger.info("Successfully connected to Supabase pgvector database.")
         except Exception as e:
-            logger.error(f"Failed to initialize Supabase client: {e}. Falling back to in-memory store.")
+            logger.error(f"Failed to initialize Supabase client: {e}. Falling back to SQLite.")
             self.supabase = None
 
     async def get_embedding(self, text: str) -> Optional[List[float]]:
@@ -52,9 +98,7 @@ class MemoryManager:
         if not self.openai_client or not text or not text.strip():
             return None
 
-        # Truncate text if excessively long to avoid token limits
         safe_text = text.strip()[:8000]
-
         try:
             response = await self.openai_client.embeddings.create(
                 model=config.openai_embedding_model,
@@ -75,61 +119,218 @@ class MemoryManager:
         message_type: str = "text",
         is_owner: bool = False,
         metadata: Optional[Dict[str, Any]] = None,
+        telegram_message_id: Optional[int] = None,
+        created_at: Optional[str] = None,
     ) -> bool:
         """
-        Store a message into Supabase with its vector embedding.
-        If Supabase is unavailable, stores in local in-memory fallback.
+        Store a message permanently into local SQLite database and Supabase (if active).
+        Prevents duplicate entries if telegram_message_id already exists for this chat.
         """
         if not content or not content.strip():
             return False
 
         metadata = metadata or {}
-        embedding: Optional[List[float]] = None
+        now_iso = created_at or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Only generate embeddings if Supabase is active
-        if self.supabase is not None:
-            embedding = await self.get_embedding(content)
+        # 1. Store into SQLite asynchronously
+        def _sqlite_insert():
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    if telegram_message_id is not None:
+                        cursor.execute(
+                            """
+                            INSERT OR IGNORE INTO chat_messages 
+                            (chat_id, telegram_message_id, sender_id, sender_name, role, content, message_type, is_owner, created_at, metadata)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                chat_id,
+                                telegram_message_id,
+                                sender_id,
+                                sender_name,
+                                role,
+                                content.strip(),
+                                message_type,
+                                1 if is_owner else 0,
+                                now_iso,
+                                json.dumps(metadata, ensure_ascii=False),
+                            ),
+                        )
+                    else:
+                        cursor.execute(
+                            """
+                            INSERT INTO chat_messages 
+                            (chat_id, sender_id, sender_name, role, content, message_type, is_owner, created_at, metadata)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                chat_id,
+                                sender_id,
+                                sender_name,
+                                role,
+                                content.strip(),
+                                message_type,
+                                1 if is_owner else 0,
+                                now_iso,
+                                json.dumps(metadata, ensure_ascii=False),
+                            ),
+                        )
+                    conn.commit()
+                return True
+            except Exception as sql_err:
+                logger.error(f"SQLite store error: {sql_err}")
+                return False
 
+        await asyncio.to_thread(_sqlite_insert)
+
+        # 2. In-memory cache update
         record = {
             "chat_id": chat_id,
+            "telegram_message_id": telegram_message_id,
             "sender_id": sender_id,
             "sender_name": sender_name,
             "is_owner": is_owner,
             "role": role,
             "message_type": message_type,
-            "content": content,
+            "content": content.strip(),
+            "created_at": now_iso,
             "metadata": metadata,
         }
-
-        # Local in-memory backup always updated for instant session recall
-        self._in_memory_fallback[chat_id].append(
-            {**record, "created_at": None}
-        )
+        self._in_memory_fallback[chat_id].append(record)
         if len(self._in_memory_fallback[chat_id]) > 50:
             self._in_memory_fallback[chat_id].pop(0)
 
-        if self.supabase is None:
-            return True
+        # 3. Supabase sync if configured
+        if self.supabase is not None:
+            try:
+                embedding = await self.get_embedding(content)
+                data_to_insert = {
+                    "chat_id": chat_id,
+                    "sender_id": sender_id,
+                    "sender_name": sender_name,
+                    "is_owner": is_owner,
+                    "role": role,
+                    "message_type": message_type,
+                    "content": content.strip(),
+                    "metadata": metadata,
+                }
+                if embedding is not None:
+                    data_to_insert["embedding"] = embedding
 
-        # Store in Supabase asynchronously
-        try:
-            data_to_insert = {**record}
-            if embedding is not None:
-                data_to_insert["embedding"] = embedding
+                def _insert():
+                    return (
+                        self.supabase.table(config.supabase_table_name)
+                        .insert(data_to_insert)
+                        .execute()
+                    )
 
-            def _insert():
-                return (
-                    self.supabase.table(config.supabase_table_name)
-                    .insert(data_to_insert)
-                    .execute()
-                )
+                await asyncio.to_thread(_insert)
+            except Exception as e:
+                logger.debug(f"Supabase store error: {e}")
 
-            await asyncio.to_thread(_insert)
-            logger.debug(f"Stored message [{role}] from {sender_name} ({chat_id}) into Supabase.")
-            return True
-        except Exception as e:
-            logger.error(f"Error inserting message to Supabase: {e}")
-            return False
+        return True
+
+    async def update_last_assistant_telegram_id(
+        self, chat_id: int, telegram_message_id: int
+    ) -> None:
+        """Update the telegram_message_id of the most recent assistant message in SQLite."""
+        def _update():
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        UPDATE chat_messages 
+                        SET telegram_message_id = ? 
+                        WHERE id = (
+                            SELECT id FROM chat_messages 
+                            WHERE chat_id = ? AND role = 'assistant' 
+                            ORDER BY id DESC LIMIT 1
+                        )
+                        """,
+                        (telegram_message_id, chat_id),
+                    )
+                    conn.commit()
+            except Exception as e:
+                logger.debug(f"Update last assistant id error: {e}")
+
+        await asyncio.to_thread(_update)
+
+    async def get_recent_messages(
+        self,
+        chat_id: int,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve recent messages in chronological order (oldest to newest)
+        from persistent SQLite database (with fallback to Supabase or in-memory).
+        """
+        limit = limit or config.max_recent_messages
+
+        def _sqlite_fetch():
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        SELECT id, chat_id, telegram_message_id, sender_id, sender_name, 
+                               role, message_type, content, is_owner, created_at, metadata
+                        FROM chat_messages
+                        WHERE chat_id = ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                        """,
+                        (chat_id, limit),
+                    )
+                    rows = cursor.fetchall()
+                    result = []
+                    for row in rows:
+                        result.append({
+                            "id": row["id"],
+                            "chat_id": row["chat_id"],
+                            "telegram_message_id": row["telegram_message_id"],
+                            "sender_id": row["sender_id"],
+                            "sender_name": row["sender_name"],
+                            "role": row["role"],
+                            "message_type": row["message_type"],
+                            "content": row["content"],
+                            "is_owner": bool(row["is_owner"]),
+                            "created_at": row["created_at"],
+                        })
+                    return list(reversed(result))
+            except Exception as sql_err:
+                logger.error(f"SQLite fetch error: {sql_err}")
+                return []
+
+        sqlite_records = await asyncio.to_thread(_sqlite_fetch)
+        if sqlite_records:
+            return sqlite_records
+
+        # Fallback to Supabase if SQLite returned empty
+        if self.supabase is not None:
+            try:
+                def _query():
+                    return (
+                        self.supabase.table(config.supabase_table_name)
+                        .select(
+                            "id, chat_id, sender_id, sender_name, role, message_type, content, is_owner, created_at"
+                        )
+                        .eq("chat_id", chat_id)
+                        .order("created_at", desc=True)
+                        .limit(limit)
+                        .execute()
+                    )
+
+                response = await asyncio.to_thread(_query)
+                records = response.data or []
+                return list(reversed(records))
+            except Exception as e:
+                logger.error(f"Error fetching recent messages from Supabase: {e}")
+
+        # Fallback to in-memory store
+        return self._in_memory_fallback[chat_id][-limit:]
 
     async def retrieve_semantic_context(
         self,
@@ -172,59 +373,35 @@ class MemoryManager:
             )
             return []
 
-    async def get_recent_messages(
-        self,
-        chat_id: int,
-        limit: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Retrieve recent messages in chronological order to supply direct context window.
-        """
-        limit = limit or config.max_recent_messages
+    async def clear_chat_memory(self, chat_id: int) -> bool:
+        """Clear memories for a given chat ID from SQLite, Supabase, and local cache."""
+        self._in_memory_fallback.pop(chat_id, None)
+
+        def _sqlite_delete():
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM chat_messages WHERE chat_id = ?", (chat_id,))
+                    conn.commit()
+            except Exception as e:
+                logger.error(f"SQLite delete error: {e}")
+
+        await asyncio.to_thread(_sqlite_delete)
 
         if self.supabase is not None:
             try:
-                def _query():
+                def _delete():
                     return (
                         self.supabase.table(config.supabase_table_name)
-                        .select(
-                            "id, chat_id, sender_id, sender_name, role, message_type, content, is_owner, created_at"
-                        )
+                        .delete()
                         .eq("chat_id", chat_id)
-                        .order("created_at", desc=True)
-                        .limit(limit)
                         .execute()
                     )
 
-                response = await asyncio.to_thread(_query)
-                records = response.data or []
-                # Reverse to maintain chronological order (oldest -> newest)
-                return list(reversed(records))
+                await asyncio.to_thread(_delete)
+                logger.info(f"Cleared chat memory for chat_id={chat_id} from Supabase.")
             except Exception as e:
-                logger.error(f"Error fetching recent messages from Supabase: {e}")
+                logger.error(f"Error deleting chat memory from Supabase: {e}")
+                return False
 
-        # Fallback to in-memory store
-        return self._in_memory_fallback[chat_id][-limit:]
-
-    async def clear_chat_memory(self, chat_id: int) -> bool:
-        """Clear memories for a given chat ID from Supabase and local cache."""
-        self._in_memory_fallback.pop(chat_id, None)
-
-        if self.supabase is None:
-            return True
-
-        try:
-            def _delete():
-                return (
-                    self.supabase.table(config.supabase_table_name)
-                    .delete()
-                    .eq("chat_id", chat_id)
-                    .execute()
-                )
-
-            await asyncio.to_thread(_delete)
-            logger.info(f"Cleared chat memory for chat_id={chat_id} from Supabase.")
-            return True
-        except Exception as e:
-            logger.error(f"Error deleting chat memory from Supabase: {e}")
-            return False
+        return True

@@ -70,6 +70,35 @@ class LLMHandler:
         lines.append("-------------------------------------------------------------")
         return "\n".join(lines)
 
+    def _format_recent_history(
+        self, recent_messages: List[Dict[str, Any]], active_contact: str = "Suhbatdosh"
+    ) -> str:
+        """Format recent chat history chronologically into an explicit prompt section."""
+        if not recent_messages:
+            return ""
+
+        lines = [
+            f"--- {active_contact.upper()} BILAN OLDIN YOZISHILGAN CHAT TARIXI (OXIRGI SUHBATLAR) ---"
+        ]
+        for msg in recent_messages:
+            role = msg.get("role", "user")
+            sender = msg.get("sender_name")
+            if not sender:
+                sender = config.owner_name if role == "assistant" else active_contact
+            content = msg.get("content", "").strip()
+            if not content:
+                continue
+            created_at = msg.get("created_at") or ""
+            time_tag = f" [{created_at}]" if created_at else ""
+            lines.append(f"{sender}{time_tag}: {content}")
+
+        lines.append("----------------------------------------------------------------------")
+        lines.append(
+            "MUHIM KO'RSATMA: Yuqoridagi yozishmalar tarixiga qat'iy tayanib javob bering! "
+            "Suhbatdosh bilan avval nima mavzuda gaplashgan bo'lsangiz, o'sha mavzuni to'liq bilgan holda davom ettiring."
+        )
+        return "\n".join(lines)
+
     async def generate_response(
         self,
         chat_id: int,
@@ -116,6 +145,7 @@ class LLMHandler:
         base_system_prompt = config.get_base_system_prompt(is_owner_chat=is_owner)
         current_time = self._get_current_time_str()
         rag_context_str = self._format_rag_context(retrieved_memories)
+        recent_history_str = self._format_recent_history(recent_messages, active_contact=sender_name)
 
         system_instruction = (
             f"{base_system_prompt}\n\n"
@@ -124,6 +154,8 @@ class LLMHandler:
         )
         if rag_context_str:
             system_instruction += f"\n{rag_context_str}\n"
+        if recent_history_str:
+            system_instruction += f"\n{recent_history_str}\n"
 
         # 3. Build User modality prompt text
         prompt_text_parts = []
@@ -194,6 +226,8 @@ class LLMHandler:
                 )
             )
 
+            msg_tg_id = metadata.get("message_id") if metadata else None
+
             await self.memory.store_message(
                 chat_id=chat_id,
                 sender_id=sender_id,
@@ -203,6 +237,7 @@ class LLMHandler:
                 message_type=message_type,
                 is_owner=is_owner,
                 metadata=metadata,
+                telegram_message_id=msg_tg_id,
             )
 
             await self.memory.store_message(
@@ -235,15 +270,17 @@ class LLMHandler:
         """Execute multimodal completion using Google Gemini SDK with automatic model fallback."""
         from google.genai import types
 
-        contents: List[types.Content] = []
+        raw_turns: List[types.Content] = []
 
         # Reconstruct chat turns
         for msg in recent_messages:
             role = "model" if msg.get("role") == "assistant" else "user"
             sender = msg.get("sender_name", role)
-            text = msg.get("content", "")
+            text = msg.get("content", "").strip()
+            if not text:
+                continue
             prefix = f"[{sender}]: " if role == "user" else ""
-            contents.append(
+            raw_turns.append(
                 types.Content(
                     role=role,
                     parts=[types.Part.from_text(text=f"{prefix}{text}")],
@@ -262,7 +299,22 @@ class LLMHandler:
                 except Exception as decode_err:
                     logger.debug(f"Failed to decode image frame for Gemini: {decode_err}")
 
-        contents.append(types.Content(role="user", parts=current_parts))
+        raw_turns.append(types.Content(role="user", parts=current_parts))
+
+        # Enforce alternating turns for Gemini: user -> model -> user -> model -> user
+        contents: List[types.Content] = []
+        for turn in raw_turns:
+            if not contents:
+                if turn.role != "user":
+                    continue
+                contents.append(turn)
+            elif contents[-1].role == turn.role:
+                contents[-1].parts.extend(turn.parts)
+            else:
+                contents.append(turn)
+
+        if not contents:
+            contents = [types.Content(role="user", parts=current_parts)]
 
         # Build list of models to try in order of preference
         models_to_try = [config.gemini_model]

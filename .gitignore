@@ -33,6 +33,11 @@ env/
 *.swp
 *.swo
 
+# Database files
+*.db
+*.sqlite
+data/
+
 # OS files
 Thumbs.db
 Desktop.ini
