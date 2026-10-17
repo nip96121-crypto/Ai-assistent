@@ -72,6 +72,14 @@ from utils.filters import FilterManager
 from utils.telegram_helpers import TelegramChatAction, safe_send_message
 
 
+class PendingBatch:
+    """Holds unread messages from a contact while waiting for the owner to see or reply."""
+
+    def __init__(self):
+        self.messages: list[Message] = []
+        self.task: Optional[asyncio.Task] = None
+
+
 class TelegramAIUserbot:
     """Master controller orchestrating Telethon MTProto and Multimodal AI services."""
 
@@ -99,6 +107,9 @@ class TelegramAIUserbot:
             session=session_target,
             api_id=config.telegram_api_id,
             api_hash=config.telegram_api_hash,
+            auto_reconnect=True,
+            connection_retries=None,
+            retry_delay=3,
         )
 
         # Initialize OpenAI async client if key is provided
@@ -106,9 +117,13 @@ class TelegramAIUserbot:
         if config.openai_api_key:
             self.openai_client = AsyncOpenAI(api_key=config.openai_api_key)
 
-        # Tracking dictionaries for real-time read and outgoing events
+        # Tracking state for real-time read, manual outgoing events, and smart message debouncing
         self.last_read_inbox: dict[int, int] = {}
-        self.last_outgoing_time: dict[int, float] = {}
+        self.last_manual_outgoing_time: dict[int, float] = {}
+        self.last_global_manual_outgoing_time: float = 0.0
+        self.bot_sent_msg_ids: set[int] = set()
+        self.pending_batches: dict[int, PendingBatch] = {}
+        self._cached_owner_online: bool = False
 
         # Initialize Subsystems
         self.memory_manager = MemoryManager(self.openai_client)
@@ -126,19 +141,55 @@ class TelegramAIUserbot:
         async def message_router(event: events.NewMessage.Event):
             await self._handle_message(event.message)
 
+        @self.client.on(events.UserUpdate)
+        async def on_user_status_update(event: events.UserUpdate.Event):
+            # Listen for owner online/offline status changes in real-time
+            if self.filter_manager.owner_id and event.user_id == self.filter_manager.owner_id:
+                if event.online is not None:
+                    self._cached_owner_online = event.online
+                    state_str = "ONLAYN (Telegramda)" if event.online else "OFLAYN (Chiqib ketgan)"
+                    logger.info(f"👤 Egasi holati yangilandi: {state_str}")
+
         @self.client.on(events.MessageRead(inbox=True))
         async def on_message_read(event: events.MessageRead.Event):
             current_max = self.last_read_inbox.get(event.chat_id, 0)
             self.last_read_inbox[event.chat_id] = max(current_max, event.max_id)
             logger.debug(f"Chat {event.chat_id} read up to message ID {event.max_id}")
 
+            # If the owner personally opened and read the pending messages, cancel AI response immediately!
+            if event.chat_id in self.pending_batches:
+                batch = self.pending_batches.pop(event.chat_id, None)
+                if batch and batch.task and not batch.task.done():
+                    batch.task.cancel()
+                logger.info(f"Chat {event.chat_id} was READ by owner. Cancelled pending AI auto-reply.")
+
         @self.client.on(events.NewMessage(outgoing=True))
         async def on_outgoing_message(event: events.NewMessage.Event):
-            if event.message and event.message.date:
-                self.last_outgoing_time[event.chat_id] = event.message.date.timestamp()
+            if not event.message:
+                return
+            # If this message was dispatched by our bot, do not treat it as manual owner typing
+            if event.message.id in self.bot_sent_msg_ids:
+                return
+
+            if event.message.date:
+                import time
+                self.last_global_manual_outgoing_time = time.time()
+                self.last_manual_outgoing_time[event.chat_id] = event.message.date.timestamp()
+                # If owner typed personally in this chat, cancel pending AI auto-reply immediately!
+                if event.chat_id in self.pending_batches:
+                    batch = self.pending_batches.pop(event.chat_id, None)
+                    if batch and batch.task and not batch.task.done():
+                        batch.task.cancel()
+                    logger.info(f"Owner personally replied in chat {event.chat_id}. Cancelled pending AI batch.")
 
     async def is_owner_online(self) -> bool:
         """Check whether the owner (Ayubxon) is currently active/online on Telegram."""
+        import time
+        # 1. If owner sent a manual message in Telegram anywhere within the last 60 seconds, owner is definitely active
+        if time.time() - getattr(self, "last_global_manual_outgoing_time", 0.0) < 60:
+            return True
+
+        # 2. Query Telegram server directly for latest UserStatus of the owner
         try:
             from telethon.tl.types import InputUserSelf, UserStatusOnline
             from telethon.tl.functions.users import GetUsersRequest
@@ -150,10 +201,17 @@ class TelegramAIUserbot:
                 if isinstance(status, UserStatusOnline):
                     now = datetime.datetime.now(datetime.timezone.utc)
                     if status.expires and status.expires > now:
+                        self._cached_owner_online = True
                         return True
+                    self._cached_owner_online = False
+                    return False
+                else:
+                    self._cached_owner_online = False
+                    return False
         except Exception as e:
             logger.debug(f"Error checking owner online status: {e}")
-        return False
+
+        return getattr(self, "_cached_owner_online", False)
 
     async def is_message_read_on_server(self, chat_id: int, message_id: int) -> bool:
         """Check Telegram server dialog read state."""
@@ -173,13 +231,8 @@ class TelegramAIUserbot:
         return False
 
     async def _handle_message(self, message: Message) -> None:
-        """Central message inspection, filter check, media processing, and AI reply dispatch."""
+        """Central message inspection, online check, filter check, and AI reply dispatch."""
         chat_id = message.chat_id
-        sender = await message.get_sender()
-        sender_id = message.sender_id or 0
-        sender_name = (
-            getattr(sender, "first_name", "") or getattr(sender, "title", "User")
-        ).strip()
 
         # 1. Handle Owner Management Commands (.ai ...)
         is_cmd, cmd_output = await self.filter_manager.check_command(message)
@@ -197,124 +250,208 @@ class TelegramAIUserbot:
 
         is_owner = self.filter_manager.is_saved_messages(message)
 
-        # 3. Check Owner Status & Grace Period for External Private Chats
-        if not is_owner and message.is_private:
-            # A. If owner is currently online on Telegram, do NOT reply (owner can answer personally)
-            if config.only_reply_when_offline and await self.is_owner_online():
-                logger.info(
-                    f"Owner {config.owner_name} is currently ONLINE on Telegram. "
-                    f"Skipping AI reply to {sender_name} ({sender_id}) so owner can reply personally."
-                )
-                return
+        # 3. If in Saved Messages (owner copilot mode), process immediately
+        if is_owner:
+            await self._process_messages_and_reply(chat_id, [message], is_owner=True)
+            return
 
-            # B. If delay is configured, wait and monitor if owner sees or replies to the message
-            if config.reply_delay_seconds > 0:
-                logger.info(
-                    f"Message from {sender_name} received while offline. "
-                    f"Waiting {config.reply_delay_seconds}s to check if owner sees or replies..."
-                )
-                loop = asyncio.get_event_loop()
-                start_time = loop.time()
-                while loop.time() - start_time < config.reply_delay_seconds:
-                    await asyncio.sleep(2)
+        # 4. If in group chat (if groups enabled in config)
+        if not message.is_private:
+            await self._process_messages_and_reply(chat_id, [message], is_owner=False)
+            return
 
-                    # Check 1: Did owner come online?
-                    if config.only_reply_when_offline and await self.is_owner_online():
-                        logger.info(
-                            f"Owner {config.owner_name} came ONLINE during wait. "
-                            f"Cancelling AI reply for {sender_name}."
-                        )
-                        return
+        # 5. External Private Chat:
+        # AGAR EGASI TELEGRAMGA KIRIB ONLAYN BO'LSA - AI JAVOB YOZMAYDI (Avtomatik to'xtaydi)!
+        if config.only_reply_when_offline and await self.is_owner_online():
+            sender = await message.get_sender()
+            sender_name = (
+                getattr(sender, "first_name", "") or getattr(sender, "title", "User")
+            ).strip()
+            logger.info(
+                f"👤 Egasi ({config.owner_name}) hozir Telegramda ONLAYN! "
+                f"AI {sender_name} ga javob bermaydi (egasi o'zi yozishi mumkin)."
+            )
+            return
 
-                    # Check 2: Did owner read this message?
-                    if self.last_read_inbox.get(chat_id, 0) >= message.id:
-                        logger.info(
-                            f"Message {message.id} was READ by owner. "
-                            f"Cancelling AI reply for {sender_name}."
-                        )
-                        return
+        # Agar bu chatda egasining o'zi oxirgi 60 soniya ichida yozgan bo'lsa - AI aralashmaydi
+        import time
+        if time.time() - self.last_manual_outgoing_time.get(chat_id, 0.0) < 60:
+            logger.info(f"Egasi bu chatda ({chat_id}) yaqinda o'zi yozgan. AI aralashmaydi.")
+            return
 
-                    # Check 3: Did owner personally reply in this chat?
-                    msg_time = message.date.timestamp() if message.date else 0.0
-                    if self.last_outgoing_time.get(chat_id, 0.0) >= msg_time:
-                        logger.info(
-                            f"Owner personally replied in chat {chat_id}. "
-                            f"Cancelling AI reply for {sender_name}."
-                        )
-                        return
+        # 6. Agar egasi oflayn bo'lsa (telegramdan chiqqan):
+        # A. Agar kutish vaqti 0 bo'lsa - SRAZI (darhol) javob qaytaradi!
+        if config.reply_delay_seconds <= 0:
+            logger.info(f"Egasi oflayn. {chat_id} dan kelgan xabarga AI darhol (srazi) javob tayyorlamoqda...")
+            await self._process_messages_and_reply(chat_id, [message], is_owner=False)
+            return
 
-                # Double check with server dialog read status before generating response
-                if await self.is_message_read_on_server(chat_id, message.id):
-                    logger.info(
-                        f"Message {message.id} was confirmed READ on Telegram server. "
-                        f"Cancelling AI reply for {sender_name}."
-                    )
+        # B. Agar kechiktirish belgilangan bo'lsa (reply_delay_seconds > 0):
+        batch = self.pending_batches.setdefault(chat_id, PendingBatch())
+        batch.messages.append(message)
+
+        # Reset timer task on each new message from the contact so we wait after the LAST message
+        if batch.task and not batch.task.done():
+            batch.task.cancel()
+
+        batch.task = asyncio.create_task(self._wait_and_dispatch_batch(chat_id, batch))
+
+    async def _wait_and_dispatch_batch(self, chat_id: int, batch: PendingBatch) -> None:
+        """Wait for grace period while monitoring if owner reads or replies."""
+        try:
+            wait_seconds = config.reply_delay_seconds
+            logger.info(
+                f"Waiting {wait_seconds}s for chat {chat_id} (collected {len(batch.messages)} message(s)) "
+                f"to check if owner sees or replies..."
+            )
+            loop = asyncio.get_event_loop()
+            start_time = loop.time()
+
+            while loop.time() - start_time < wait_seconds:
+                await asyncio.sleep(1.5)
+
+                # Check 1: Did owner come online?
+                if config.only_reply_when_offline and await self.is_owner_online():
+                    logger.info(f"Owner {config.owner_name} came ONLINE during wait. Cancelling AI reply.")
+                    self.pending_batches.pop(chat_id, None)
                     return
 
-        # 4. Modality Detection & Pre-processing
-        text_content: Optional[str] = message.text or None
+                # Check 2: Did owner read this chat up to the latest message?
+                latest_id = max((m.id for m in batch.messages), default=0)
+                if self.last_read_inbox.get(chat_id, 0) >= latest_id:
+                    logger.info(f"Chat {chat_id} was READ by owner. Cancelling AI reply.")
+                    self.pending_batches.pop(chat_id, None)
+                    return
+
+                # Check 3: Did owner manually reply in this chat?
+                earliest_msg_time = min(
+                    (m.date.timestamp() for m in batch.messages if m.date),
+                    default=0.0,
+                )
+                if self.last_manual_outgoing_time.get(chat_id, 0.0) >= earliest_msg_time:
+                    logger.info(f"Owner manually replied in chat {chat_id}. Cancelling AI reply.")
+                    self.pending_batches.pop(chat_id, None)
+                    return
+
+            # Double check with server dialog read status before generating response
+            latest_id = max((m.id for m in batch.messages), default=0)
+            if await self.is_message_read_on_server(chat_id, latest_id):
+                logger.info(f"Chat {chat_id} was confirmed READ on Telegram server. Cancelling AI reply.")
+                self.pending_batches.pop(chat_id, None)
+                return
+
+            messages_to_process = list(batch.messages)
+            self.pending_batches.pop(chat_id, None)
+            if not messages_to_process:
+                return
+
+            await self._process_messages_and_reply(chat_id, messages_to_process, is_owner=False)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error in _wait_and_dispatch_batch for chat {chat_id}: {e}", exc_info=True)
+            self.pending_batches.pop(chat_id, None)
+
+    async def _process_messages_and_reply(
+        self,
+        chat_id: int,
+        messages: list[Message],
+        is_owner: bool = False,
+    ) -> None:
+        """Processes one or more incoming messages, generates AI response, and sends reply."""
+        if not messages:
+            return
+
+        latest_message = messages[-1]
+        sender = await latest_message.get_sender()
+        sender_id = latest_message.sender_id or 0
+        sender_name = (
+            getattr(sender, "first_name", "") or getattr(sender, "title", "User")
+        ).strip()
+
+        # Extract contents across messages
+        text_parts: list[str] = []
         audio_transcript: Optional[str] = None
-        video_frames_b64 = None
+        video_frames_b64: Optional[list[str]] = None
         message_type = "text"
         simulated_action = "typing"
 
-        # Check for Voice Note / Audio
-        if message.voice or (message.audio and getattr(message.audio, "voice", False)):
-            message_type = "voice"
-            simulated_action = "record-audio"
-            logger.info(f"Processing voice message from {sender_name} ({sender_id})...")
-            async with TelegramChatAction(self.client, chat_id, action="record-audio"):
-                audio_transcript, _ = await self.audio_handler.process_voice_message(message)
+        for msg in messages:
+            # Voice message
+            if msg.voice or (msg.audio and getattr(msg.audio, "voice", False)):
+                message_type = "voice"
+                simulated_action = "record-audio"
+                logger.info(f"Processing voice message from {sender_name} ({sender_id})...")
+                async with TelegramChatAction(self.client, chat_id, action="record-audio"):
+                    v_trans, _ = await self.audio_handler.process_voice_message(msg)
+                    if v_trans:
+                        audio_transcript = v_trans
+                        text_parts.append(f"[Ovozli xabar]: \"{v_trans}\"")
+                    if msg.text:
+                        text_parts.append(msg.text)
+            # Video note or regular video
+            elif msg.video_note or msg.video:
+                message_type = "video"
+                simulated_action = "typing"
+                logger.info(f"Processing video message from {sender_name} ({sender_id})...")
+                async with TelegramChatAction(self.client, chat_id, action="typing"):
+                    v_res = await self.video_handler.process_video_message(msg)
+                    v_trans = v_res.get("transcription")
+                    video_frames_b64 = v_res.get("frames_b64")
+                    if v_trans:
+                        audio_transcript = v_trans
+                        text_parts.append(f"[Video xabar ovozi]: \"{v_trans}\"")
+                    if msg.text:
+                        text_parts.append(msg.text)
+            else:
+                if msg.text:
+                    text_parts.append(msg.text)
 
-        # Check for Video Note (Round video) or regular Video
-        elif message.video_note or message.video:
-            message_type = "video"
-            simulated_action = "typing"
-            logger.info(f"Processing video message from {sender_name} ({sender_id})...")
-            async with TelegramChatAction(self.client, chat_id, action="typing"):
-                video_res = await self.video_handler.process_video_message(message)
-                audio_transcript = video_res.get("transcription")
-                video_frames_b64 = video_res.get("frames_b64")
+        combined_text = "\n".join(text_parts).strip()
+        if not combined_text and not video_frames_b64:
+            logger.debug(f"No textual or visual content detected for chat {chat_id}.")
+            return
 
-        # 5. Generate Autonomous Executive AI Response
+        # Generate autonomous response (as Ayubxon himself if external contact, or copilot if is_owner)
         async with TelegramChatAction(self.client, chat_id, action=simulated_action):
             reply_text = await self.llm_handler.generate_response(
                 chat_id=chat_id,
                 sender_id=sender_id,
                 sender_name=sender_name,
-                text_content=text_content,
+                text_content=combined_text,
                 audio_transcript=audio_transcript,
                 video_frames_b64=video_frames_b64,
                 is_owner=is_owner,
                 message_type=message_type,
-                metadata={"message_id": message.id},
+                metadata={"message_id": latest_message.id},
             )
 
-        # 6. Dispatch reply safely to Telegram
         if reply_text and reply_text.strip():
-            await safe_send_message(
+            sent_msg = await safe_send_message(
                 client=self.client,
                 chat_id=chat_id,
                 text=reply_text,
-                reply_to=message,
+                reply_to=latest_message,
             )
+            if sent_msg:
+                self.bot_sent_msg_ids.add(sent_msg.id)
 
-            # Mark message as read AFTER the AI assistant has replied
-            if config.auto_read_messages and not message.out:
+            # Mark message as read AFTER the AI userbot has replied
+            if config.auto_read_messages and not latest_message.out:
                 try:
-                    await message.mark_read()
+                    await latest_message.mark_read()
                 except Exception as e:
                     logger.debug(f"Could not mark message as read: {e}")
 
-            # If an external contact sent a message in private chat,
-            # send a private report to Ayubxon's Saved Messages ("me") so ONLY Ayubxon sees it!
-            if not is_owner and message.is_private:
+            # Send Saved Messages notification for Ayubxon so he knows what was answered on his behalf!
+            if not is_owner and latest_message.is_private:
                 try:
                     summary_text = (
-                        f"📩 **Yangi xabar keldi (Faqat siz uchun hisobot):**\n\n"
+                        f"📩 **Siz band bo'lganingizda sizning nomingizdan javob berildi:**\n\n"
                         f"👤 **Kimdan:** {sender_name} (ID: `{sender_id}`)\n"
-                        f"💬 **Xabar:** {text_content or audio_transcript or '(Media)'}\n\n"
-                        f"🤖 **Bot bergan javob:**\n{reply_text}"
+                        f"💬 **Kelgan xabar(lar):**\n{combined_text}\n\n"
+                        f"💬 **Sizdek berilgan javob:**\n{reply_text}"
                     )
                     await self.client.send_message("me", summary_text)
                 except Exception as notif_err:
@@ -387,29 +524,64 @@ class TelegramAIUserbot:
             f"{'Supabase pgvector (RAG)' if config.is_supabase_configured() else 'In-Memory Cache'}"
         )
         print("=" * 70)
-        # If running on Render Web Service, start lightweight HTTP healthcheck server
+        # ----------------------------------------------------------------------
+        # Keep-Alive 24/7: Lightweight HTTP Healthcheck Server & Heartbeat Pinger
+        # ----------------------------------------------------------------------
         import os
-        port_str = os.getenv("PORT")
-        if port_str:
-            try:
-                from aiohttp import web
-                port = int(port_str)
-                app = web.Application()
-                app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
-                app.router.add_get("/health", lambda r: web.Response(text="OK"))
-                runner = web.AppRunner(app)
-                await runner.setup()
-                site = web.TCPSite(runner, "0.0.0.0", port)
-                await site.start()
-                logger.info(f"Render healthcheck HTTP server running on port {port}")
-            except Exception as e:
-                logger.warning(f"Could not start Render healthcheck server: {e}")
+        import time
+        import datetime
+        from aiohttp import web
 
-        # Keep-alive background task to prevent Render free tier from idling/sleeping
+        bot_start_time = time.time()
+        port = int(os.getenv("PORT", "8080"))
+
+        async def handle_root(request):
+            uptime_min = int((time.time() - bot_start_time) / 60)
+            return web.Response(
+                text=f"🟢 Sunnatbek AI Userbot 24/7 faol ishlamoqda!\nIsh vaqti (Uptime): {uptime_min} daqiqa\nHolat: OK\n",
+                content_type="text/plain; charset=utf-8",
+            )
+
+        async def handle_health(request):
+            uptime_sec = int(time.time() - bot_start_time)
+            return web.json_response(
+                {
+                    "status": "healthy",
+                    "service": "Telegram AI Userbot",
+                    "uptime_seconds": uptime_sec,
+                    "uptime_minutes": uptime_sec // 60,
+                    "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+
+        async def handle_ping(request):
+            return web.Response(text="pong", content_type="text/plain; charset=utf-8")
+
+        try:
+            http_app = web.Application()
+            http_app.router.add_get("/", handle_root)
+            http_app.router.add_get("/health", handle_health)
+            http_app.router.add_get("/ping", handle_ping)
+            runner = web.AppRunner(http_app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            await site.start()
+            logger.info(f"🚀 24/7 Keep-alive HTTP server faol ishga tushdi (Port: {port})")
+        except Exception as e:
+            logger.warning(f"⚠️ HTTP serverni ishga tushirishda ogohlantirish: {e}")
+
+        # Keep-alive background task to prevent server free tier from sleeping
         async def keep_alive_pinger():
-            """Keep bot alive: sends HTTP ping to Render and sends heartbeat message to Telegram Saved Messages."""
+            """
+            Keep bot alive 24/7:
+            1. Sends HTTP ping to Render/Cloud Web Service to reset inactivity sleep timer.
+            2. Sends heartbeat status message to Telegram Saved Messages ('me') every 13 minutes.
+            """
             import aiohttp
-            import datetime
+
+            # Heartbeat interval (default 13 minutes = 780 seconds)
+            interval_minutes = int(os.getenv("HEARTBEAT_INTERVAL_MINUTES", "13"))
+            interval_seconds = max(60, interval_minutes * 60)
 
             url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PING_URL")
             target_url = None
@@ -417,34 +589,66 @@ class TelegramAIUserbot:
                 if not url.startswith("http"):
                     url = f"https://{url}"
                 target_url = f"{url.rstrip('/')}/health"
-                logger.info(f"🚀 Render Keep-alive HTTP pinger active for: {target_url}")
+                logger.info(f"🚀 Keep-alive tashqi ping manzili: {target_url}")
 
-            # Heartbeat to Telegram Saved Messages ("me") every 14 minutes
             send_tg_msg = os.getenv("SEND_TELEGRAM_HEARTBEAT", "True").lower() in ("true", "1", "yes")
 
-            # Initial wait before starting pinger loop
-            await asyncio.sleep(60)
+            # Dastlabki 30 soniya kutib, birinchi salomlashish/ishga tushish xabarini yuboramiz
+            await asyncio.sleep(30)
+            if send_tg_msg:
+                try:
+                    start_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    welcome_msg = (
+                        f"🚀 **Bot serverda 24/7 muvaffaqiyatli ishga tushdi!**\n\n"
+                        f"⏰ Boshlangan vaqt: `{start_str}`\n"
+                        f"🔄 Har **{interval_minutes} daqiqada** o'ziga o'zi holat xabari tashlab turadi.\n"
+                        f"✅ Server uxlab qolmasligi uchun tizim to'liq sozlangan."
+                    )
+                    await self.client.send_message("me", welcome_msg)
+                    logger.info("📩 Dastlabki ishga tushish xabari Saved Messages ga yuborildi.")
+                except Exception as first_msg_err:
+                    logger.debug(f"Birinchi heartbeat xabarini yuborishda xatolik: {first_msg_err}")
+
+            # Asosiy 13 daqiqalik davriy sikl
             while True:
-                # 1. HTTP ping to Render web service (resets Render 15-minute inactivity timer)
-                if target_url:
+                try:
+                    await asyncio.sleep(interval_seconds)
+
+                    # 1. HTTP ping (tashqi server yoki local healthcheck)
+                    ping_target = target_url or f"http://127.0.0.1:{port}/health"
                     try:
                         async with aiohttp.ClientSession() as session:
-                            async with session.get(target_url, timeout=25) as resp:
-                                logger.info(f"⏰ Keep-alive HTTP ping sent to {target_url} (HTTP {resp.status})")
+                            async with session.get(ping_target, timeout=25) as resp:
+                                logger.info(f"⏰ Keep-alive HTTP ping yuborildi: {ping_target} (HTTP {resp.status})")
                     except Exception as ping_err:
-                        logger.debug(f"Keep-alive HTTP ping error: {ping_err}")
+                        logger.debug(f"Keep-alive HTTP ping xatosi: {ping_err}")
 
-                # 2. Telegram message to Saved Messages ("me") so user sees bot is alive 24/7
-                if send_tg_msg:
-                    try:
-                        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        await self.client.send_message("me", f"💓 **Bot faol (24/7):** Server ishlab turibdi.\nVaqt: `{now_str}`")
-                        logger.info("📩 Heartbeat message sent to Saved Messages.")
-                    except Exception as tg_err:
-                        logger.debug(f"Telegram heartbeat send error: {tg_err}")
+                    # 2. Telegram 'Saved Messages' ('me') ga har 13 daqiqada xabar tashlash
+                    if send_tg_msg:
+                        try:
+                            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            uptime_total_min = int((time.time() - bot_start_time) / 60)
+                            uptime_hours = uptime_total_min // 60
+                            uptime_mins = uptime_total_min % 60
+                            uptime_display = f"{uptime_hours} soat {uptime_mins} daqiqa" if uptime_hours > 0 else f"{uptime_mins} daqiqa"
 
-                # Sleep 14 minutes (840 seconds)
-                await asyncio.sleep(14 * 60)
+                            heartbeat_msg = (
+                                f"💓 **Bot faol (24/7 holat tekshiruvi)**\n"
+                                f"━━━━━━━━━━━━━━━━━━━━\n"
+                                f"✅ Server to'xtovsiz ishlamoqda.\n"
+                                f"⏰ Hozirgi vaqt: `{now_str}`\n"
+                                f"⏳ Ish vaqti (Uptime): `{uptime_display}`\n"
+                                f"🔄 Keyingi xabar: {interval_minutes} daqiqadan so'ng"
+                            )
+                            await self.client.send_message("me", heartbeat_msg)
+                            logger.info("📩 13 daqiqalik holat xabari Saqlangan xabarlarga (me) yuborildi.")
+                        except Exception as tg_err:
+                            logger.warning(f"Telegram heartbeat xabarini yuborishda xatolik: {tg_err}")
+
+                except asyncio.CancelledError:
+                    break
+                except Exception as loop_err:
+                    logger.error(f"Keep-alive pinger siklida kutilmagan xatolik: {loop_err}")
 
         asyncio.create_task(keep_alive_pinger())
 

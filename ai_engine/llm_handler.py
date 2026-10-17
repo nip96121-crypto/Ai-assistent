@@ -208,7 +208,7 @@ class LLMHandler:
             await self.memory.store_message(
                 chat_id=chat_id,
                 sender_id=0,
-                sender_name=config.assistant_name,
+                sender_name=config.assistant_name if is_owner else config.owner_name,
                 role="assistant",
                 content=clean_reply,
                 message_type="text",
